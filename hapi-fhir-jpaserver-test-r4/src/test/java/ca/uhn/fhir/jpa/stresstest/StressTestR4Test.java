@@ -21,6 +21,9 @@ import ca.uhn.fhir.util.StopWatch;
 import com.google.common.base.Charsets;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+
+import java.util.Arrays;
+
 import org.apache.commons.io.IOUtils;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
@@ -191,6 +194,79 @@ public class StressTestR4Test extends BaseResourceProviderR4Test {
 		}
 
 		assertThat(ids).hasSize(resourceCount);
+	}
+
+	//@Disabled("Stress test")
+	@Test
+	public void testSlowPage() throws Exception {
+		// This is a modified version of the above test to replicate the issue reported in:
+		// https://github.com/hapifhir/hapi-fhir/issues/6109
+		// The notable changes are:
+		// - Number of resources are 10x to better demonstrate the performance issue.
+		// - Checking IDs are removed as it is not the focus of this test.
+		// - The search parameters (`date` and `_sort`) are removed to make sure they have no
+		//   negative performance impact.
+		// - `setSearchPreFetchThresholds` list parameter is modified.
+		// - The `setLoadingThrottleForUnitTests` is changed for faster test runs.
+		// - The WARN messages added are triggered at indices 60 and 300; the latter can be over 10s.
+
+		int resourceCount = 10000;
+		int queryCount = 30;
+
+		// This seems to be the crucial settings; loading beyond 300 resources would incur a
+		// very slow page fetch because all other resources are prefetched.
+		List<Integer> searchPreFetchThresholds = Lists.newArrayList(70, 300, -1);
+		ourLog.info("setSearchPreFetchThresholds: {}", Arrays.toString(searchPreFetchThresholds.toArray()));
+		myStorageSettings.setSearchPreFetchThresholds(searchPreFetchThresholds);
+
+		SearchCoordinatorSvcImpl searchCoordinator = AopTestUtils.getTargetObject(mySearchCoordinatorSvc);
+		searchCoordinator.setLoadingThrottleForUnitTests(1);
+
+		Bundle bundle = new Bundle();
+
+		for (int i = 0; i < resourceCount; i++) {
+			Observation o = new Observation();
+			o.setId("A" + leftPad(Integer.toString(i), 4, '0'));
+			o.setEffective(DateTimeType.now());
+			o.setStatus(Observation.ObservationStatus.FINAL);
+			bundle.addEntry().setFullUrl(o.getId()).setResource(o).getRequest().setMethod(HTTPVerb.PUT).setUrl("Observation/A" + i);
+		}
+		StopWatch sw = new StopWatch();
+		ourLog.info("Saving {} resources", bundle.getEntry().size());
+		mySystemDao.transaction(null, bundle);
+		ourLog.info("Saved {} resources in {}", bundle.getEntry().size(), sw);
+
+		IGenericClient fhirClient = this.myClient;
+
+		String url = myServerBase + "/Observation";
+
+		int pageIndex = 0;
+		ourLog.info("Loading page {}", pageIndex);
+		Bundle searchResult = fhirClient
+			.search()
+			.byUrl(url)
+			.count(queryCount)
+			.returnBundle(Bundle.class)
+			.execute();
+		while (true) {
+			if (searchResult.getLink(Constants.LINK_NEXT) == null) {
+				break;
+			} else {
+				if (searchResult.getEntry().size() != queryCount) {
+					throw new Exception("Page had " + searchResult.getEntry().size() + " resources");
+				}
+			}
+
+			pageIndex++;
+			ourLog.info("Loading page {}: {}", pageIndex, searchResult.getLink(Constants.LINK_NEXT).getUrl());
+			StopWatch fetchTimer = new StopWatch();
+			searchResult = fhirClient.loadPage().next(searchResult).execute();
+			if (fetchTimer.getMillis() > 100) {
+				ourLog.warn(
+					"Loading page {} at index {} took too long: {}",
+					pageIndex, pageIndex * queryCount, fetchTimer);
+			}
+		}
 	}
 
 	@Disabled("Stress test")
